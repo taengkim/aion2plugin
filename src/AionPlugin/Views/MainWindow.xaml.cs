@@ -11,8 +11,8 @@ public partial class MainWindow : Window
     private OverlayWindow? _overlay;
 
     // 설정 바인딩용 프로퍼티
-    public string ServerIp   { get; set; } = string.Empty;
-    public string ServerName { get; set; } = string.Empty;
+    public string ServerNetCidr { get; set; } = PacketCapture.DefaultNetCidr;
+    public string ServerName    { get; set; } = string.Empty;
 
     public MainWindow()
     {
@@ -52,12 +52,13 @@ public partial class MainWindow : Window
         else
         {
             int deviceIdx = CmbDevice.SelectedIndex;
-            string ip     = TxtServerIp.Text.Trim();
+            string cidr   = TxtServerIp.Text.Trim();
             string server = TxtServerName.Text.Trim();
 
             TxtError.Visibility = Visibility.Collapsed;
 
-            _plugin.Start(deviceIdx, string.IsNullOrEmpty(ip) ? null : ip, server);
+            // serverNetCidr null 이면 기본값(206.127.156.0/24) 사용
+            _plugin.Start(deviceIdx, string.IsNullOrEmpty(cidr) ? null : cidr, server);
 
             BtnStartStop.Content = "중지";
             BtnStartStop.Background = new System.Windows.Media.SolidColorBrush(
@@ -151,7 +152,8 @@ public partial class MainWindow : Window
     private void LoadSettings()
     {
         var s = Properties.Settings.Default;
-        TxtServerIp.Text   = s.ServerIp;
+        TxtServerIp.Text   = string.IsNullOrEmpty(s.ServerNetCidr)
+            ? PacketCapture.DefaultNetCidr : s.ServerNetCidr;
         TxtServerName.Text = s.ServerName;
         ChkShowAtuul.IsChecked = s.ShowAtuul;
     }
@@ -159,8 +161,8 @@ public partial class MainWindow : Window
     private void SaveSettings()
     {
         var s = Properties.Settings.Default;
-        s.ServerIp   = TxtServerIp.Text.Trim();
-        s.ServerName = TxtServerName.Text.Trim();
+        s.ServerNetCidr = TxtServerIp.Text.Trim();
+        s.ServerName    = TxtServerName.Text.Trim();
         s.Save();
     }
 

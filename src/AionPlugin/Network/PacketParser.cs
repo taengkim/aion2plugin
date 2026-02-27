@@ -1,206 +1,312 @@
 using AionPlugin.Models;
-using System.Buffers.Binary;
 using System.Text;
 
 namespace AionPlugin.Network;
 
 /// <summary>
-/// 아이온2 게임 패킷을 파싱해 게임 이벤트를 생성합니다.
+/// 아이온2 서버→클라이언트 패킷을 파싱합니다.
 ///
-/// ※ 주의: 아이온2의 실제 패킷 구조는 역공학으로 파악해야 합니다.
-///   아래 OpCode 와 오프셋은 커뮤니티 분석 자료를 바탕으로 한 추정값이며,
-///   실제 게임과 다를 수 있습니다. 패킷 스니핑 결과에 맞게 업데이트하세요.
+/// 패킷 구조 분석 출처: AION2Meter4J (ion2me/Aion2Meter_public)
+///
+/// 핵심 규칙:
+///   - 모든 숫자 필드는 VarInt (7-bit 가변 길이) 인코딩
+///   - 패킷 = [VarInt 전체길이] [2바이트 Opcode] [필드들...] [트레일러 06 00 36]
+///   - StreamProcessor 에서 트레일러를 제거한 뒤 이 클래스로 전달됨
 /// </summary>
 public class PacketParser
 {
     // ──────────────────────────────────────────────────
-    //  서버 → 클라이언트 OpCode (추정값, 업데이트 필요)
+    //  OpCode (2 바이트, big-endian 표현)
     // ──────────────────────────────────────────────────
-    private const ushort OP_ATTACK_RESULT   = 0x0075;  // 공격 결과
-    private const ushort OP_SKILL_RESULT    = 0x0076;  // 스킬 결과
-    private const ushort OP_PLAYER_INFO     = 0x0021;  // 플레이어 정보
-    private const ushort OP_PARTY_INFO      = 0x0097;  // 파티원 목록
-    private const ushort OP_PLAYER_SPAWN    = 0x0011;  // 플레이어 입장
-    private const ushort OP_PLAYER_DESPAWN  = 0x0012;  // 플레이어 퇴장
-    private const ushort OP_COMBAT_START    = 0x01A0;  // 전투 시작
-    private const ushort OP_COMBAT_END      = 0x01A1;  // 전투 종료
+    // 일반 데미지:  첫 바이트=0x04, 둘째=0x38
+    // DoT 데미지:   첫 바이트=0x05, 둘째=0x38
+    // 닉네임:       첫 바이트=0x04, 둘째=0x8D
+    // 맵 ID:        첫 바이트=0x00, 둘째=0x61
+    // 소환/스폰:    첫 바이트=0x40, 둘째=0x36
+    private const byte OP_DAMAGE_B0      = 0x04;
+    private const byte OP_DAMAGE_B1      = 0x38;
+    private const byte OP_DOT_B0         = 0x05;
+    private const byte OP_DOT_B1         = 0x38;
+    private const byte OP_NICKNAME_B0    = 0x04;
+    private const byte OP_NICKNAME_B1    = 0x8D;
 
+    private const int  FLAG_MASK = 0x0F;  // switchVariable 하위 4비트
+
+    // ──────────────────────────────────────────────────
+    //  이벤트
+    // ──────────────────────────────────────────────────
     public event Action<DamageEvent>? DamageEventParsed;
-    public event Action<Player>? PlayerInfoParsed;
-    public event Action<List<Player>>? PartyInfoParsed;
-    public event Action? CombatStarted;
-    public event Action? CombatEnded;
+    public event Action<(int EntityId, string Name)>? NicknameParsed;
 
-    private readonly PacketBuffer _serverBuffer = new();
-    private readonly PacketBuffer _clientBuffer = new();
+    private readonly PacketBuffer _buffer = new();
 
-    /// <summary>
-    /// 원시 패킷 데이터를 파싱합니다.
-    /// </summary>
-    public void Feed(RawPacketData raw)
+    // ──────────────────────────────────────────────────
+    //  진입점
+    // ──────────────────────────────────────────────────
+
+    /// <summary>서버에서 수신한 TCP 청크를 공급합니다.</summary>
+    public void Feed(byte[] tcpChunk)
     {
-        var buffer = raw.IsFromServer ? _serverBuffer : _clientBuffer;
-        foreach (var packet in buffer.Feed(raw.Data))
-        {
-            if (raw.IsFromServer)
-                ParseServerPacket(packet);
-        }
+        foreach (var packet in _buffer.Feed(tcpChunk))
+            ParsePacket(packet);
     }
 
-    private void ParseServerPacket(Aion2Packet packet)
+    // ──────────────────────────────────────────────────
+    //  패킷 라우팅 (StreamProcessor.parsePerfectPacket 동일 순서)
+    // ──────────────────────────────────────────────────
+
+    private void ParsePacket(byte[] packet)
     {
+        if (packet.Length < 3) return;
+
         try
         {
-            switch (packet.OpCode)
+            // 1. 전체 길이가 VarInt 길이 필드와 일치하면 정상 패킷
+            var (len, lenSize) = ReadVarInt(packet, 0);
+            if (lenSize < 0) return;
+
+            int offset = lenSize;
+            if (offset + 2 > packet.Length) return;
+
+            byte b0 = packet[offset];
+            byte b1 = packet[offset + 1];
+
+            // 첫 바이트가 0x20 이면 데미지 포맷 아님 (StreamProcessor 동일 처리)
+            if (b0 == 0x20) return;
+
+            // 일반 데미지
+            if (b0 == OP_DAMAGE_B0 && b1 == OP_DAMAGE_B1)
             {
-                case OP_ATTACK_RESULT:
-                case OP_SKILL_RESULT:
-                    ParseDamagePacket(packet);
-                    break;
-                case OP_PLAYER_INFO:
-                    ParsePlayerInfo(packet);
-                    break;
-                case OP_PARTY_INFO:
-                    ParsePartyInfo(packet);
-                    break;
-                case OP_COMBAT_START:
-                    CombatStarted?.Invoke();
-                    break;
-                case OP_COMBAT_END:
-                    CombatEnded?.Invoke();
-                    break;
+                ParseDamage(packet, offset + 2, isDot: false);
+                return;
+            }
+
+            // DoT 데미지
+            if (b0 == OP_DOT_B0 && b1 == OP_DOT_B1)
+            {
+                ParseDamage(packet, offset + 2, isDot: true);
+                return;
+            }
+
+            // 닉네임
+            if (b0 == OP_NICKNAME_B0 && b1 == OP_NICKNAME_B1)
+            {
+                ParseNickname(packet, offset + 2);
             }
         }
         catch
         {
-            // 파싱 실패 시 해당 패킷 무시
+            // 파싱 실패 패킷은 무시
         }
     }
 
-    /// <summary>
-    /// 데미지 패킷 파싱
-    /// 실제 오프셋은 패킷 스니핑 후 업데이트 필요
-    /// </summary>
-    private void ParseDamagePacket(Aion2Packet packet)
+    // ──────────────────────────────────────────────────
+    //  일반 데미지 파싱  (StreamProcessor.parsingDamage)
+    //
+    //  필드 순서:
+    //    [VarInt targetId]
+    //    [VarInt switchVariable]
+    //    [VarInt flag]
+    //    [VarInt actorId]
+    //    [UInt32LE skillCode] [1 byte skip]
+    //    [VarInt type]
+    //    [Special block: (switch & 0x0F) → 4→8 B, 5→12 B, 6→10 B, 7→14 B]
+    //    [VarInt unknown]
+    //    [VarInt damage]
+    //    [VarInt loop]
+    // ──────────────────────────────────────────────────
+    private void ParseDamage(byte[] p, int offset, bool isDot)
     {
-        var data = packet.Payload;
-        if (data.Length < 20) return;
+        if (isDot)
+        {
+            ParseDoT(p, offset);
+            return;
+        }
 
-        int offset = 0;
+        // targetId
+        var (targetId, tSz) = ReadVarInt(p, offset); if (tSz < 0) return;
+        offset += tSz;
 
-        uint attackerId = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4));
+        // switchVariable
+        var (sw, swSz) = ReadVarInt(p, offset); if (swSz < 0) return;
+        offset += swSz;
+
+        // flag
+        var (flag, flSz) = ReadVarInt(p, offset); if (flSz < 0) return;
+        offset += flSz;
+
+        // actorId
+        var (actorId, aSz) = ReadVarInt(p, offset); if (aSz < 0) return;
+        offset += aSz;
+
+        // skillCode (UInt32LE) + 1 byte skip
+        if (offset + 5 > p.Length) return;
+        int skillCode = ReadUInt32LE(p, offset);
+        offset += 5;   // 4 + 1 skip
+
+        // type
+        var (type, tpSz) = ReadVarInt(p, offset); if (tpSz < 0) return;
+        offset += tpSz;
+
+        // special 블록 크기 결정 (switch & 0x0F)
+        int specialsLen = (sw & FLAG_MASK) switch
+        {
+            4 => 8,
+            5 => 12,
+            6 => 10,
+            7 => 14,
+            _ => -1
+        };
+        if (specialsLen < 0) return;
+
+        // specials
+        SpecialDamage specials = SpecialDamage.None;
+        if (specialsLen > 0 && offset + specialsLen <= p.Length)
+        {
+            if (specialsLen != 8)  // 8 바이트 블록은 플래그 없음 (원본 동일)
+                specials = (SpecialDamage)(p[offset] & 0xFF);
+        }
+        offset += specialsLen;
+        if (offset > p.Length) return;
+
+        // unknown
+        var (_, uSz) = ReadVarInt(p, offset); if (uSz < 0) return;
+        offset += uSz;
+
+        // damage
+        var (damage, dSz) = ReadVarInt(p, offset); if (dSz < 0) return;
+        offset += dSz;
+
+        // 자해 제외 (actorId == targetId)
+        if (actorId == targetId || damage == 0) return;
+
+        DamageEventParsed?.Invoke(new DamageEvent
+        {
+            ActorId        = actorId,
+            TargetId       = targetId,
+            SkillCode      = skillCode,
+            Damage         = damage,
+            Type           = type,
+            Specials       = specials,
+            SwitchVariable = sw,
+            IsDot          = false,
+            Timestamp      = DateTime.UtcNow
+        });
+    }
+
+    // ──────────────────────────────────────────────────
+    //  DoT 데미지 파싱  (StreamProcessor.parseDoTPacket)
+    //
+    //  필드 순서:
+    //    [VarInt targetId]
+    //    [1 byte skip]
+    //    [VarInt actorId]
+    //    [VarInt unknown]
+    //    [UInt32LE skillCode / 100]
+    //    [VarInt damage]
+    // ──────────────────────────────────────────────────
+    private void ParseDoT(byte[] p, int offset)
+    {
+        var (targetId, tSz) = ReadVarInt(p, offset); if (tSz < 0) return;
+        offset += tSz + 1;   // +1 skip
+
+        var (actorId, aSz) = ReadVarInt(p, offset); if (aSz < 0) return;
+        if (actorId == targetId) return;
+        offset += aSz;
+
+        var (_, uSz) = ReadVarInt(p, offset); if (uSz < 0) return;
+        offset += uSz;
+
+        if (offset + 4 > p.Length) return;
+        int skillCode = ReadUInt32LE(p, offset) / 100;
         offset += 4;
 
-        uint targetId = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4));
-        offset += 4;
-
-        uint skillId = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4));
-        offset += 4;
-
-        int damage = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(offset, 4));
-        offset += 4;
-
-        byte flags = data[offset];
-        bool isCritical = (flags & 0x01) != 0;
-        bool isMagical  = (flags & 0x02) != 0;
+        var (damage, dSz) = ReadVarInt(p, offset); if (dSz < 0) return;
 
         if (damage == 0) return;
 
         DamageEventParsed?.Invoke(new DamageEvent
         {
-            AttackerId = attackerId,
-            TargetId   = targetId,
-            SkillId    = skillId,
-            Damage     = damage,
-            IsCritical = isCritical,
-            Type       = isMagical ? DamageType.Magical : DamageType.Physical,
-            Timestamp  = packet.Timestamp
+            ActorId   = actorId,
+            TargetId  = targetId,
+            SkillCode = skillCode,
+            Damage    = damage,
+            IsDot     = true,
+            Timestamp = DateTime.UtcNow
         });
     }
 
-    /// <summary>
-    /// 플레이어 정보 패킷 파싱
-    /// </summary>
-    private void ParsePlayerInfo(Aion2Packet packet)
+    // ──────────────────────────────────────────────────
+    //  닉네임 파싱  (StreamProcessor.parsingNickname)
+    //
+    //  offset = 2 (opcode 이미 소비) 기준
+    //  절대 offset 10 부터 VarInt entityId, 그 다음 1 byte 이름 길이, UTF-8 이름
+    // ──────────────────────────────────────────────────
+    private void ParseNickname(byte[] p, int opcodeBodyStart)
     {
-        var data = packet.Payload;
-        if (data.Length < 12) return;
+        // 닉네임 패킷: opcode 2바이트 이미 소비, VarInt 길이 앞에 있었음
+        // StreamProcessor 는 offset=10 에서 VarInt entityId 를 읽음
+        // (VarInt 길이 크기가 다를 수 있어 고정 10을 씀 - 원본과 동일)
+        int offset = 10;
+        if (offset >= p.Length) return;
 
-        int offset = 0;
+        var (entityId, eSz) = ReadVarInt(p, offset);
+        if (eSz <= 0) return;
+        offset += eSz;
 
-        uint objectId = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4));
-        offset += 4;
+        if (offset >= p.Length) return;
+        int nameLen = p[offset] & 0xFF;
+        if (nameLen <= 0 || nameLen > 72) return;
+        offset++;
 
-        // 이름 길이 (2 bytes) + 이름 (UTF-16LE)
-        ushort nameLen = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(offset, 2));
-        offset += 2;
+        if (offset + nameLen > p.Length) return;
+        string name = Encoding.UTF8.GetString(p, offset, nameLen);
 
-        if (data.Length < offset + nameLen * 2 + 2) return;
-
-        string name = Encoding.Unicode.GetString(data, offset, nameLen * 2);
-        offset += nameLen * 2;
-
-        byte classId = data[offset];
-        string className = ClassIdToName(classId);
-
-        PlayerInfoParsed?.Invoke(new Player
-        {
-            ObjectId  = objectId,
-            Name      = name,
-            ClassName = className
-        });
+        if (IsValidNickname(name))
+            NicknameParsed?.Invoke((entityId, name));
     }
 
+    // ──────────────────────────────────────────────────
+    //  유틸
+    // ──────────────────────────────────────────────────
+
     /// <summary>
-    /// 파티원 목록 패킷 파싱
+    /// VarInt 디코딩 (StreamProcessor.readVarInt 동일 로직)
+    /// 반환: (값, 소비한 바이트 수). 오류 시 (-1, -1).
     /// </summary>
-    private void ParsePartyInfo(Aion2Packet packet)
+    public static (int value, int size) ReadVarInt(byte[] bytes, int offset)
     {
-        var data = packet.Payload;
-        if (data.Length < 2) return;
-
-        var players = new List<Player>();
-        int offset = 0;
-
-        byte memberCount = data[offset++];
-
-        for (int i = 0; i < memberCount && offset + 8 <= data.Length; i++)
+        int value = 0, shift = 0, count = 0;
+        while (true)
         {
-            uint objectId = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4));
-            offset += 4;
-
-            ushort nameLen = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(offset, 2));
-            offset += 2;
-
-            if (offset + nameLen * 2 > data.Length) break;
-
-            string name = Encoding.Unicode.GetString(data, offset, nameLen * 2);
-            offset += nameLen * 2;
-
-            if (offset >= data.Length) break;
-            byte classId = data[offset++];
-
-            players.Add(new Player
-            {
-                ObjectId  = objectId,
-                Name      = name,
-                ClassName = ClassIdToName(classId)
-            });
+            if (offset + count >= bytes.Length) return (-1, -1);
+            int b = bytes[offset + count] & 0xFF;
+            count++;
+            value |= (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) return (value, count);
+            shift += 7;
+            if (shift >= 32) return (-1, -1);
         }
-
-        if (players.Count > 0)
-            PartyInfoParsed?.Invoke(players);
     }
 
-    private static string ClassIdToName(byte id) => id switch
+    private static int ReadUInt32LE(byte[] p, int offset)
     {
-        1  => "Warrior",
-        2  => "Assassin",
-        3  => "Ranger",
-        4  => "Mage",
-        5  => "Healer",
-        6  => "Summoner",
-        7  => "Chanter",
-        _  => $"Class{id}"
-    };
+        return (p[offset] & 0xFF)
+             | ((p[offset + 1] & 0xFF) << 8)
+             | ((p[offset + 2] & 0xFF) << 16)
+             | ((p[offset + 3] & 0xFF) << 24);
+    }
+
+    /// <summary>
+    /// 닉네임 유효성 검사 (hasPossibilityNickname 동일)
+    /// 한글/영숫자 혼합, 순수 숫자 제외, 1글자 영문 제외
+    /// </summary>
+    private static bool IsValidNickname(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+        if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^[가-힣a-zA-Z0-9]+$")) return false;
+        if (System.Text.RegularExpressions.Regex.IsMatch(name, @"^[0-9]+$")) return false;
+        if (System.Text.RegularExpressions.Regex.IsMatch(name, @"^[A-Za-z]$")) return false;
+        return true;
+    }
 }

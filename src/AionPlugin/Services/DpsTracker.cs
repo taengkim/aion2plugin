@@ -6,17 +6,20 @@ namespace AionPlugin.Services;
 
 /// <summary>
 /// 파티원 DPS를 추적하고 실시간 랭킹을 유지합니다.
+/// EntityRegistry 와 연동해 EntityId → Player 이름을 해결합니다.
 /// </summary>
 public class DpsTracker : IDisposable
 {
     private CombatSession? _currentSession;
-    private readonly Dictionary<uint, Player> _players = new();
+    private readonly EntityRegistry _registry;
     private readonly DispatcherTimer _updateTimer;
     private bool _isInCombat;
 
-    /// <summary>
-    /// UI 바인딩용 정렬된 플레이어 목록 (DPS 내림차순)
-    /// </summary>
+    // 전투 비활성 타임아웃: 마지막 데미지 후 12초 (DataStorage.COMBAT_WINDOW_MS 동일)
+    private const double CombatTimeoutSec = 12.0;
+    private DateTime _lastDamageAt;
+
+    /// <summary>UI 바인딩용 정렬된 플레이어 목록 (총 딜 내림차순)</summary>
     public ObservableCollection<Player> SortedPlayers { get; } = new();
 
     public bool IsInCombat => _isInCombat;
@@ -26,38 +29,14 @@ public class DpsTracker : IDisposable
     public event Action? SessionEnded;
     public event Action? DataUpdated;
 
-    public DpsTracker()
+    public DpsTracker(EntityRegistry registry)
     {
+        _registry = registry;
         _updateTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(500) // 0.5초마다 UI 갱신
+            Interval = TimeSpan.FromMilliseconds(500)
         };
-        _updateTimer.Tick += (_, _) => UpdateDisplayValues();
-    }
-
-    // ──────────────────────────────────────────────────
-    //  파티원 등록
-    // ──────────────────────────────────────────────────
-
-    public void RegisterPlayer(Player player)
-    {
-        if (_players.ContainsKey(player.ObjectId))
-        {
-            // 이름/직업 업데이트
-            var existing = _players[player.ObjectId];
-            existing.Name = player.Name;
-            existing.ClassName = player.ClassName;
-        }
-        else
-        {
-            _players[player.ObjectId] = player;
-        }
-    }
-
-    public void RegisterParty(IEnumerable<Player> players)
-    {
-        foreach (var p in players)
-            RegisterPlayer(p);
+        _updateTimer.Tick += (_, _) => Tick();
     }
 
     // ──────────────────────────────────────────────────
@@ -79,7 +58,7 @@ public class DpsTracker : IDisposable
         _currentSession.EndTime = DateTime.UtcNow;
         _isInCombat = false;
         _updateTimer.Stop();
-        UpdateDisplayValues(isFinal: true);
+        UpdateDisplayValues();
         SessionEnded?.Invoke();
     }
 
@@ -89,15 +68,10 @@ public class DpsTracker : IDisposable
         _isInCombat = false;
         _updateTimer.Stop();
 
-        foreach (var p in _players.Values)
-        {
-            p.TotalDamage = 0;
-            p.Dps = 0;
-            p.DamagePercent = 0;
-        }
-
         System.Windows.Application.Current.Dispatcher.Invoke(() =>
-            SortedPlayers.Clear());
+        {
+            SortedPlayers.Clear();
+        });
     }
 
     // ──────────────────────────────────────────────────
@@ -106,54 +80,56 @@ public class DpsTracker : IDisposable
 
     public void OnDamageEvent(DamageEvent evt)
     {
-        // 치유는 DPS 집계에서 제외 (필요 시 힐러 별도 집계 가능)
         if (evt.Damage <= 0) return;
 
-        // 전투 중이 아니면 자동 시작
+        // 전투 중 아니면 자동 시작
         if (!_isInCombat)
             StartSession();
 
+        _lastDamageAt = DateTime.UtcNow;
         _currentSession?.Events.Add(evt);
 
-        // 알려지지 않은 공격자 → 임시 등록
-        if (!_players.TryGetValue(evt.AttackerId, out _))
-        {
-            _players[evt.AttackerId] = new Player
-            {
-                ObjectId = evt.AttackerId,
-                Name = $"Unknown({evt.AttackerId})",
-                ClassName = "Unknown"
-            };
-        }
+        // EntityRegistry 에 없으면 임시 등록
+        _registry.GetOrCreate(evt.ActorId);
     }
 
     // ──────────────────────────────────────────────────
-    //  UI 값 계산 & 갱신
+    //  주기 갱신
     // ──────────────────────────────────────────────────
 
-    private void UpdateDisplayValues(bool isFinal = false)
+    private void Tick()
+    {
+        // 마지막 데미지 후 CombatTimeoutSec 경과 시 세션 종료
+        if (_isInCombat
+            && _lastDamageAt != default
+            && (DateTime.UtcNow - _lastDamageAt).TotalSeconds > CombatTimeoutSec)
+        {
+            EndSession();
+            return;
+        }
+
+        UpdateDisplayValues();
+    }
+
+    private void UpdateDisplayValues()
     {
         if (_currentSession is null) return;
 
         double elapsed = _currentSession.ElapsedSeconds;
         var damageMap = _currentSession.DamageByAttacker()
-            .ToDictionary(x => x.AttackerId, x => x.Damage);
+            .ToDictionary(x => x.ActorId, x => x.Damage);
 
         long partyTotal = damageMap.Values.Sum();
 
         foreach (var (id, dmg) in damageMap)
         {
-            if (!_players.TryGetValue(id, out var player)) continue;
-
-            player.TotalDamage = dmg;
-            player.Dps = dmg / elapsed;
-            player.DamagePercent = partyTotal > 0
-                ? (double)dmg / partyTotal * 100.0
-                : 0;
+            var player = _registry.GetOrCreate(id);
+            player.TotalDamage   = dmg;
+            player.Dps           = dmg / elapsed;
+            player.DamagePercent = partyTotal > 0 ? (double)dmg / partyTotal * 100.0 : 0;
         }
 
-        // 정렬 갱신 (UI 스레드에서)
-        var sorted = _players.Values
+        var sorted = _registry.All
             .Where(p => p.TotalDamage > 0)
             .OrderByDescending(p => p.TotalDamage)
             .ToList();

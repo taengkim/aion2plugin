@@ -12,11 +12,11 @@ public sealed class Settings : ApplicationSettingsBase
     public static Settings Default => _default;
 
     [UserScopedSetting]
-    [DefaultSettingValue("")]
-    public string ServerIp
+    [DefaultSettingValue("206.127.156.0/24")]
+    public string ServerNetCidr
     {
-        get => (string)this[nameof(ServerIp)];
-        set => this[nameof(ServerIp)] = value;
+        get => (string)this[nameof(ServerNetCidr)];
+        set => this[nameof(ServerNetCidr)] = value;
     }
 
     [UserScopedSetting]

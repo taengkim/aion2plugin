@@ -4,52 +4,66 @@ using AionPlugin.Network;
 namespace AionPlugin.Services;
 
 /// <summary>
-/// 플러그인의 핵심 서비스 오케스트레이터
-/// PacketCapture → PacketParser → DpsTracker + AionToolsService 를 연결합니다.
+/// 플러그인 핵심 오케스트레이터
+///
+/// 파이프라인:
+///   PacketCapture (TCP 청크)
+///     → PacketParser (VarInt 파싱 → DamageEvent / Nickname)
+///     → EntityRegistry (EntityId → Player 이름 관리)
+///     → DpsTracker (세션 집계)
+///     → AionToolsService (아툴 점수 비동기 조회)
 /// </summary>
 public class PluginService : IDisposable
 {
-    private readonly PacketCapture _capture = new();
-    private readonly PacketParser _parser = new();
-    public readonly DpsTracker DpsTracker = new();
-    public readonly AionToolsService AionTools = new();
+    private readonly PacketCapture      _capture  = new();
+    private readonly PacketParser       _parser   = new();
+    public  readonly EntityRegistry     Registry  = new();
+    public  readonly AionToolsService   AionTools = new();
+    public  readonly DpsTracker         DpsTracker;
 
     private CancellationTokenSource _cts = new();
     private string _serverName = string.Empty;
 
     public bool IsRunning => _capture.IsCapturing;
 
-    public event Action<string>? StatusChanged;
+    public event Action<string>?    StatusChanged;
     public event Action<Exception>? ErrorOccurred;
 
     public PluginService()
     {
-        // 파서 이벤트 연결
-        _parser.DamageEventParsed += OnDamageEvent;
-        _parser.PlayerInfoParsed  += OnPlayerInfo;
-        _parser.PartyInfoParsed   += OnPartyInfo;
-        _parser.CombatStarted     += () => DpsTracker.StartSession();
-        _parser.CombatEnded       += () => DpsTracker.EndSession();
+        DpsTracker = new DpsTracker(Registry);
 
-        // 캡처 이벤트 연결
-        _capture.PacketReceived += raw => _parser.Feed(raw);
-        _capture.CaptureError   += ex => ErrorOccurred?.Invoke(ex);
-        _capture.CaptureStarted += () => StatusChanged?.Invoke("캡처 시작됨");
-        _capture.CaptureStopped += () => StatusChanged?.Invoke("캡처 중지됨");
+        // 파서 → 서비스 연결
+        _parser.DamageEventParsed += OnDamageEvent;
+        _parser.NicknameParsed    += OnNickname;
+
+        // 캡처 → 파서 연결 (서버→클 TCP 청크만 전달)
+        _capture.ServerChunkReceived += chunk => _parser.Feed(chunk);
+        _capture.CaptureError        += ex   => ErrorOccurred?.Invoke(ex);
+        _capture.CaptureStarted      += ()   => StatusChanged?.Invoke("패킷 캡처 시작됨");
+        _capture.CaptureStopped      += ()   => StatusChanged?.Invoke("패킷 캡처 중지됨");
     }
+
+    // ──────────────────────────────────────────────────
+    //  시작 / 중지
+    // ──────────────────────────────────────────────────
 
     /// <summary>
     /// 플러그인 시작
     /// </summary>
-    public void Start(int deviceIndex = -1, string? serverIp = null, string serverName = "")
+    /// <param name="deviceIndex">어댑터 인덱스 (-1 = 자동)</param>
+    /// <param name="serverNetCidr">서버 CIDR (null = 기본값 206.127.156.0/24)</param>
+    /// <param name="serverName">아툴 점수 조회용 서버명</param>
+    public void Start(int deviceIndex = -1, string? serverNetCidr = null, string serverName = "")
     {
         _serverName = serverName;
         _cts = new CancellationTokenSource();
 
         try
         {
-            _capture.StartCapture(deviceIndex, serverIp);
-            StatusChanged?.Invoke("아이온2 패킷 감청 중...");
+            _capture.StartCapture(deviceIndex, serverNetCidr);
+            StatusChanged?.Invoke(
+                $"아이온2 감청 중... (포트 {PacketCapture.DefaultPort}, {serverNetCidr ?? PacketCapture.DefaultNetCidr})");
         }
         catch (Exception ex)
         {
@@ -65,10 +79,14 @@ public class PluginService : IDisposable
         _cts.Cancel();
     }
 
-    public void ResetDps() => DpsTracker.ResetSession();
+    public void Reset()
+    {
+        DpsTracker.ResetSession();
+        Registry.Clear();
+    }
 
     // ──────────────────────────────────────────────────
-    //  파서 이벤트 핸들러
+    //  이벤트 핸들러
     // ──────────────────────────────────────────────────
 
     private void OnDamageEvent(DamageEvent evt)
@@ -76,26 +94,22 @@ public class PluginService : IDisposable
         DpsTracker.OnDamageEvent(evt);
     }
 
-    private void OnPlayerInfo(Player player)
+    private void OnNickname((int EntityId, string Name) info)
     {
-        DpsTracker.RegisterPlayer(player);
-        LoadAtuulScoreAsync(player);
-    }
+        Registry.UpdateNickname(info.EntityId, info.Name);
 
-    private void OnPartyInfo(List<Player> players)
-    {
-        DpsTracker.RegisterParty(players);
-        foreach (var p in players)
-            LoadAtuulScoreAsync(p);
+        // 닉네임 확정 시 아툴 점수 조회
+        var player = Registry.Find(info.EntityId);
+        if (player is not null)
+            LoadAtuulScoreAsync(player);
     }
 
     private void LoadAtuulScoreAsync(Player player)
     {
-        if (string.IsNullOrEmpty(player.Name) || player.Name.StartsWith("Unknown"))
+        if (string.IsNullOrEmpty(player.Name) || player.Name.StartsWith("User_"))
             return;
 
         player.IsLoadingAtuul = true;
-
         Task.Run(async () =>
         {
             try
@@ -104,14 +118,8 @@ public class PluginService : IDisposable
                 player.AtuulScore = score;
             }
             catch (OperationCanceledException) { }
-            catch (Exception ex)
-            {
-                ErrorOccurred?.Invoke(ex);
-            }
-            finally
-            {
-                player.IsLoadingAtuul = false;
-            }
+            catch (Exception ex) { ErrorOccurred?.Invoke(ex); }
+            finally { player.IsLoadingAtuul = false; }
         });
     }
 

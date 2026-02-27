@@ -17,7 +17,8 @@ public class Player : INotifyPropertyChanged
     private bool _isLoadingAtuul;
     private bool _isSelf;
 
-    public uint ObjectId { get; set; }
+    /// <summary>세션 동안만 유효한 동적 EntityId (VarInt)</summary>
+    public int EntityId { get; set; }
 
     public string Name
     {
@@ -91,16 +92,18 @@ public class Player : INotifyPropertyChanged
     public string DpsDisplay => $"{Dps:N0}";
     public string DamagePercentDisplay => $"{DamagePercent:F1}%";
 
+    // 직업 한국어 이름 (GameEntities.kt 기준)
     public string ClassIcon => ClassName switch
     {
-        "Warrior"     => "⚔",
-        "Assassin"    => "🗡",
-        "Ranger"      => "🏹",
-        "Mage"        => "🔮",
-        "Healer"      => "✚",
-        "Summoner"    => "🌿",
-        "Chanter"     => "🎵",
-        _             => "●"
+        "검성" => "⚔",   // Gladiator
+        "수호성" => "🛡", // Templar
+        "궁성" => "🏹",  // Ranger
+        "살성" => "🗡",  // Assassin
+        "마도성" => "🔮", // Sorcerer
+        "치유성" => "✚",  // Cleric
+        "정령성" => "🌿", // Elementalist
+        "호법성" => "🎵", // Chanter
+        _ => "●"
     };
 
     private static string FormatNumber(long n) => n switch

@@ -1,72 +1,112 @@
-using System.Buffers.Binary;
-
 namespace AionPlugin.Network;
 
 /// <summary>
-/// TCP 스트림에서 아이온2 패킷 경계를 복원합니다.
-/// 아이온2는 패킷 헤더에 길이 필드가 있습니다.
+/// 아이온2 TCP 스트림을 완성된 패킷 단위로 조립합니다.
+///
+/// 프레이밍 규칙 (AION2Meter4J 기반):
+///   - 패킷 끝에 매직 트레일러 0x06 0x00 0x36 이 붙음
+///   - StreamAssembler 와 동일하게, 트레일러 앞 데이터가 하나의 패킷
+///   - VarInt 로 인코딩된 길이 필드가 패킷 맨 앞에 있음 (자기 자신 포함)
+///   - 파서에는 트레일러 3 바이트를 제거한 데이터가 전달됨
 /// </summary>
 public class PacketBuffer
 {
-    // 헤더 레이아웃: [Length: 2 bytes LE] [OpCode: 2 bytes LE] [Data: N bytes]
-    private const int HeaderSize = 4;
+    // 패킷 끝을 알리는 매직 트레일러
+    private static readonly byte[] MagicTrailer = [0x06, 0x00, 0x36];
 
-    private readonly List<byte> _buffer = new(4096);
+    // 링 버퍼 (10 MB, PacketAccumulator 동일 크기)
+    private const int Capacity = 10 * 1024 * 1024;
+    private readonly byte[] _ring = new byte[Capacity];
+    private int _readPos;
+    private int _writePos;
+    private int _count;
 
     /// <summary>
-    /// 원시 TCP 데이터를 버퍼에 추가하고 완성된 패킷들을 꺼냅니다.
+    /// TCP 청크를 누적하고, 완성된 패킷을 반환합니다.
     /// </summary>
-    public IEnumerable<Aion2Packet> Feed(byte[] data)
+    public IEnumerable<byte[]> Feed(byte[] data)
     {
-        _buffer.AddRange(data);
+        Append(data);
 
-        while (_buffer.Count >= HeaderSize)
+        while (true)
         {
-            // 패킷 길이 (헤더 포함)
-            ushort packetLength = BinaryPrimitives.ReadUInt16LittleEndian(
-                _buffer.Take(2).ToArray());
+            int idx = IndexOf(MagicTrailer);
+            if (idx == -1) yield break;   // 트레일러가 아직 없음 = 더 기다림
 
-            if (packetLength < HeaderSize || packetLength > 65535)
-            {
-                // 잘못된 패킷 → 스트림 재동기화
-                _buffer.Clear();
-                yield break;
-            }
+            // 트레일러 포함 길이
+            int packetLen = idx + MagicTrailer.Length;
+            byte[] raw = ReadAndDiscard(packetLen);
 
-            if (_buffer.Count < packetLength)
-                yield break; // 아직 데이터가 부족
-
-            ushort opCode = BinaryPrimitives.ReadUInt16LittleEndian(
-                _buffer.Skip(2).Take(2).ToArray());
-
-            byte[] payload = _buffer.Skip(HeaderSize)
-                                    .Take(packetLength - HeaderSize)
-                                    .ToArray();
-
-            _buffer.RemoveRange(0, packetLength);
-
-            yield return new Aion2Packet
-            {
-                Length = packetLength,
-                OpCode = opCode,
-                Payload = payload,
-                Timestamp = DateTime.UtcNow
-            };
+            // 트레일러 3바이트 제거 후 전달
+            if (raw.Length > MagicTrailer.Length)
+                yield return raw[..^MagicTrailer.Length];
         }
     }
 
-    public void Reset() => _buffer.Clear();
-}
+    public void Reset()
+    {
+        _readPos = 0;
+        _writePos = 0;
+        _count = 0;
+    }
 
-/// <summary>
-/// 파싱된 아이온2 패킷 한 개
-/// </summary>
-public class Aion2Packet
-{
-    public ushort Length { get; init; }
-    public ushort OpCode { get; init; }
-    public byte[] Payload { get; init; } = Array.Empty<byte>();
-    public DateTime Timestamp { get; init; }
+    // ──────────────────────────────────────────────────
+    //  링 버퍼 내부 구현
+    // ──────────────────────────────────────────────────
 
-    public override string ToString() => $"[0x{OpCode:X4}] len={Length}";
+    private void Append(byte[] data)
+    {
+        if (_count + data.Length > Capacity)
+        {
+            Reset();  // 오버플로우 시 초기화 (PacketAccumulator 동일 처리)
+            return;
+        }
+
+        int spaceToEnd = Capacity - _writePos;
+        int copyLen = Math.Min(data.Length, spaceToEnd);
+        Array.Copy(data, 0, _ring, _writePos, copyLen);
+
+        if (data.Length > copyLen)
+            Array.Copy(data, copyLen, _ring, 0, data.Length - copyLen);
+
+        _writePos = (_writePos + data.Length) % Capacity;
+        _count += data.Length;
+    }
+
+    private int IndexOf(byte[] pattern)
+    {
+        if (_count < pattern.Length) return -1;
+
+        for (int i = 0; i <= _count - pattern.Length; i++)
+        {
+            bool match = true;
+            for (int j = 0; j < pattern.Length; j++)
+            {
+                if (_ring[(_readPos + i + j) % Capacity] != pattern[j])
+                {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return i;
+        }
+        return -1;
+    }
+
+    private byte[] ReadAndDiscard(int length)
+    {
+        if (length <= 0 || length > _count) return [];
+
+        var result = new byte[length];
+        int spaceToEnd = Capacity - _readPos;
+        int copyLen = Math.Min(length, spaceToEnd);
+
+        Array.Copy(_ring, _readPos, result, 0, copyLen);
+        if (length > copyLen)
+            Array.Copy(_ring, 0, result, copyLen, length - copyLen);
+
+        _readPos = (_readPos + length) % Capacity;
+        _count -= length;
+        return result;
+    }
 }

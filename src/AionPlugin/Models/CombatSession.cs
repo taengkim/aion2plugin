@@ -22,12 +22,12 @@ public class CombatSession
     /// <summary>세션 내 전체 데미지 합산</summary>
     public long TotalDamage => Events
         .Where(e => e.Damage > 0)
-        .Sum(e => e.Damage);
+        .Sum(e => (long)e.Damage);
 
-    /// <summary>공격자별 데미지 집계</summary>
-    public IEnumerable<(uint AttackerId, long Damage)> DamageByAttacker()
+    /// <summary>공격자(ActorId)별 데미지 집계</summary>
+    public IEnumerable<(int ActorId, long Damage)> DamageByAttacker()
         => Events
             .Where(e => e.Damage > 0)
-            .GroupBy(e => e.AttackerId)
-            .Select(g => (g.Key, g.Sum(e => e.Damage)));
+            .GroupBy(e => e.ActorId)
+            .Select(g => (g.Key, g.Sum(e => (long)e.Damage)));
 }
