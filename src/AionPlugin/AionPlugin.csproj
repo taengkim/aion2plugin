@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>AionPlugin</AssemblyName>
+    <RootNamespace>AionPlugin</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Platforms>x64</Platforms>
+    <ApplicationIcon>Resources\icon.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 패킷 캡처: SharpPcap (Npcap/WinPcap wrapper) -->
+    <PackageReference Include="SharpPcap" Version="6.3.0" />
+    <PackageReference Include="PacketDotNet" Version="1.4.7" />
+
+    <!-- HTTP 클라이언트 (aion2tools.com API) -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+
+    <!-- 시스템 트레이 아이콘 -->
+    <PackageReference Include="Hardcodet.NotifyIcon.Wpf" Version="2.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Resources\icon.ico" Condition="Exists('Resources\icon.ico')" />
+  </ItemGroup>
+
+</Project>

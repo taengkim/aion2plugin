@@ -1,0 +1,26 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.userprefs
+
+## NuGet
+packages/
+*.nupkg
+project.lock.json
+
+## Build
+*.exe
+*.dll
+*.pdb
+*.cache
+
+## OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+## Settings (사용자별 설정은 커밋하지 않음)
+src/AionPlugin/Properties/Settings.settings
